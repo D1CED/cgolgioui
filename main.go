@@ -1,11 +1,9 @@
 package main
 
 import (
-	"fmt"
 	"image"
 	"image/color"
 	"math/rand"
-	"os"
 	"time"
 
 	"gioui.org/app"
@@ -15,6 +13,7 @@ import (
 	"gioui.org/io/pointer"
 	"gioui.org/io/system"
 	"gioui.org/layout"
+	"gioui.org/op"
 	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
@@ -27,14 +26,13 @@ const TileSize = 30
 type board [FieldDimensions][FieldDimensions]bool
 
 type State struct {
-	Board     board // liveness of all cells
-	Running   bool
-	startBtn  widget.Button
-	randomBtn widget.Button
-	clearBtn  widget.Button
-	lastStop  time.Time    // time when the game was stopped last
-	ticker    *time.Ticker // the ticker that initiates a game loop
-	pressedOn image.Point  // the cell last clicked on
+	board      board // liveness of all cells
+	running    bool
+	startBtn   widget.Button
+	randomBtn  widget.Button
+	clearBtn   widget.Button
+	lastUpdate time.Time   // time when the game was stopped last
+	pressedOn  image.Point // the cell last clicked on
 }
 
 func main() {
@@ -51,89 +49,53 @@ func eventLoop(w *app.Window) {
 	gtx := layout.NewContext(w.Queue())
 
 	state := new(State)
-	state.lastStop = time.Now()
 	state.pressedOn = image.Point{-1, -1}
-	var tChan <-chan time.Time            // initiates the game loop
 	var boardHandler event.Key = new(int) // a unique key
 
-	for {
-		select {
-		case e, ok := <-w.Events():
-			switch evt := e.(type) {
-			case system.FrameEvent:
-				// fmt.Println("repaint", time.Now())
-				gtx.Reset(evt.Config, evt.Size)
+	for e := range w.Events() {
+		if evt, ok := e.(system.FrameEvent); ok {
+			gtx.Reset(evt.Config, evt.Size)
 
-				if processInputs(gtx, state, &tChan, boardHandler) {
-					// fmt.Println("input")
-				}
+			processInputs(gtx, state, boardHandler)
 
-				layout.NW.Layout(gtx, func() {
-					layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-						layout.Rigid(func() {
-							drawPlayground(gtx, state, boardHandler)
-						}),
-						layout.Rigid(func() {
-							drawControls(gtx, th, state)
-						}),
-					)
-				})
+			layout.NW.Layout(gtx, func() {
+				layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					layout.Rigid(func() {
+						drawPlayground(gtx, state, boardHandler)
+					}),
+					layout.Rigid(func() {
+						drawControls(gtx, th, state)
+					}),
+				)
+			})
 
-				evt.Frame(gtx.Ops)
-			case system.DestroyEvent:
-				if evt.Err != nil {
-					fmt.Fprint(os.Stderr, evt.Err)
-				}
-				return
-			default:
-				if !ok {
-					fmt.Fprint(os.Stderr, "chan closed before destroy")
-					return
-				}
-			}
-		case <-tChan:
-			gameLoop(state)
-			w.Invalidate()
+			evt.Frame(gtx.Ops)
 		}
 	}
 }
 
-func processInputs(gtx *layout.Context, state *State, ch *(<-chan time.Time), boardHandler event.Key) bool {
+func processInputs(gtx *layout.Context, state *State, boardHandler event.Key) bool {
 	repaint := false
 
 	if state.startBtn.Clicked(gtx) {
-		state.Running = !state.Running
-		if !state.Running {
-			state.lastStop = time.Now()
-			state.ticker.Stop()
-			*ch = nil
-		} else {
-			state.ticker = time.NewTicker(200 * time.Millisecond)
-			*ch = state.ticker.C
+		state.running = !state.running
+		repaint = true
+	}
+	if state.randomBtn.Clicked(gtx) && !state.running {
+		for y := 0; y < FieldDimensions; y++ {
+			for x := 0; x < FieldDimensions; x++ {
+				tint := false
+				if rand.Float32() < 0.2 {
+					tint = true
+				}
+				state.board[x][y] = tint
+			}
 		}
 		repaint = true
 	}
-	if !state.Running {
-		if h := state.randomBtn.History(); state.randomBtn.Clicked(gtx) &&
-			len(h) > 0 && h[0].Time.After(state.lastStop) {
-
-			for y := 0; y < FieldDimensions; y++ {
-				for x := 0; x < FieldDimensions; x++ {
-					tint := false
-					if rand.Float32() < 0.2 {
-						tint = true
-					}
-					state.Board[x][y] = tint
-				}
-			}
-			repaint = true
-		}
-		if h := state.clearBtn.History(); state.clearBtn.Clicked(gtx) &&
-			len(h) > 0 && h[0].Time.After(state.lastStop) {
-
-			state.Board = board{}
-			repaint = true
-		}
+	if state.clearBtn.Clicked(gtx) && !state.running {
+		state.board = board{}
+		repaint = true
 	}
 
 	// check for clicks on the board
@@ -154,7 +116,7 @@ func processInputs(gtx *layout.Context, state *State, ch *(<-chan time.Time), bo
 		if evt.Type == pointer.Press {
 			state.pressedOn = image.Point{x, y}
 		} else if evt.Type == pointer.Release && (image.Point{x, y}) == state.pressedOn {
-			state.Board[x][y] = !state.Board[x][y]
+			state.board[x][y] = !state.board[x][y]
 			repaint = true
 		}
 	}
@@ -162,6 +124,13 @@ func processInputs(gtx *layout.Context, state *State, ch *(<-chan time.Time), bo
 }
 
 func drawPlayground(gtx *layout.Context, state *State, boardHandler event.Key) {
+
+	if state.running && gtx.Now().After(state.lastUpdate.Add(200*time.Millisecond)) {
+		gameLoop(state)
+		state.lastUpdate = gtx.Now()
+	}
+	op.InvalidateOp{state.lastUpdate.Add(200 * time.Millisecond)}.Add(gtx.Ops)
+
 	// draw gray background
 	paint.ColorOp{color.RGBA{0xF0, 0xF0, 0xF0, 0xFF}}.Add(gtx.Ops)
 	paint.PaintOp{
@@ -174,7 +143,7 @@ func drawPlayground(gtx *layout.Context, state *State, boardHandler event.Key) {
 	paint.ColorOp{color.RGBA{0, 0, 0, 0xFF}}.Add(gtx.Ops)
 	for y := 0; y < FieldDimensions; y++ {
 		for x := 0; x < FieldDimensions; x++ {
-			if state.Board[x][y] {
+			if state.board[x][y] {
 				paint.PaintOp{
 					Rect: f32.Rectangle{
 						Min: f32.Point{float32(x * TileSize), float32(y * TileSize)},
@@ -201,21 +170,21 @@ func drawControls(gtx *layout.Context, th *material.Theme, state *State) {
 	layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
 		layout.Flexed(1./3, func() {
 			txt := "Stopped"
-			if state.Running {
+			if state.running {
 				txt = "Running"
 			}
 			th.Button(txt).Layout(gtx, &state.startBtn)
 		}),
 		layout.Flexed(1./3, func() {
 			b := th.Button("Random")
-			if state.Running {
+			if state.running {
 				b.Background = color.RGBA{0x88, 0x88, 0x88, 0xFF}
 			}
 			b.Layout(gtx, &state.randomBtn)
 		}),
 		layout.Flexed(1./3, func() {
 			b := th.Button("Clear")
-			if state.Running {
+			if state.running {
 				b.Background = color.RGBA{0x88, 0x88, 0x88, 0xFF}
 			}
 			b.Layout(gtx, &state.clearBtn)
@@ -247,8 +216,8 @@ func gameLoop(state *State) {
 
 	for y := 0; y < FieldDimensions; y++ {
 		for x := 0; x < FieldDimensions; x++ {
-			count := countAliveNeigh(&state.Board, x, y)
-			if state.Board[x][y] {
+			count := countAliveNeigh(&state.board, x, y)
+			if state.board[x][y] {
 				if count == 2 || count == 3 {
 					newBoard[x][y] = true
 				}
@@ -259,5 +228,5 @@ func gameLoop(state *State) {
 			}
 		}
 	}
-	state.Board = newBoard
+	state.board = newBoard
 }
